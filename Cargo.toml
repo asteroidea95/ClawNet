@@ -1,0 +1,38 @@
+[package]
+name = "clawnet"
+version = "0.1.0"
+description = "C端去中心化算力网络 - 把你闲置的设备变成全球算力的一部分"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/<YOUR_USERNAME>/ClawNet"
+
+[dependencies]
+# Gossip / Membership
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CRDT
+# automerge = { version = "0.5", optional = true }
+# yrs = { version = "0.19", optional = true }
+
+# Crypto
+ed25519-dalek = "2"
+rand = "0.8"
+
+# Networking
+reqwest = { version = "0.12", features = ["json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bin]]
+name = "clawnet"
+path = "src/main.rs"
+
+[lib]
+name = "clawnet_core"
+path = "src/lib.rs"
