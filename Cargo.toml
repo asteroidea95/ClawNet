@@ -19,6 +19,10 @@ serde_json = "1"
 # Crypto
 ed25519-dalek = "2"
 rand = "0.8"
+sha2 = "0.10"
+
+# Serialization (.soul format)
+bincode = "1"
 
 # Networking
 reqwest = { version = "0.12", features = ["json"] }

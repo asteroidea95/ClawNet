@@ -1,7 +1,7 @@
 // 调度器 — 任务拆解与分发
 
 use crate::crypto::NodeId;
-use crate::ledger::TokenLedger;
+use crate::ledger::UnifiedLedger;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -42,7 +42,7 @@ pub struct Task {
 /// 调度器
 pub struct Scheduler {
     node_id: NodeId,
-    ledger: Arc<RwLock<TokenLedger>>,
+    ledger: Arc<RwLock<UnifiedLedger>>,
     // 待办任务队列
     pending_tasks: Arc<RwLock<Vec<Task>>>,
 }
@@ -50,7 +50,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new(
         node_id: NodeId,
-        ledger: Arc<RwLock<TokenLedger>>,
+        ledger: Arc<RwLock<UnifiedLedger>>,
         _gossip: crate::gossip::Engine,
     ) -> Self {
         Scheduler {

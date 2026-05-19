@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod gossip;
 pub mod ledger;
 pub mod scheduler;
+pub mod soul;
 pub mod transport;
 pub mod worker;
 
@@ -14,7 +15,7 @@ use tokio::sync::RwLock;
 pub struct Node {
     pub id: crypto::NodeId,
     pub gossip: gossip::Engine,
-    pub ledger: Arc<RwLock<ledger::TokenLedger>>,
+    pub unified_ledger: Arc<RwLock<ledger::UnifiedLedger>>,
     pub scheduler: scheduler::Scheduler,
     pub transport: transport::Transport,
     pub worker_registry: worker::Registry,
@@ -30,11 +31,17 @@ impl Node {
         // 2. 启动 gossip 引擎（节点发现 + 状态同步）
         let gossip = gossip::Engine::new(node_id.clone(), &config.seed_nodes).await?;
 
-        // 3. 初始化令牌台账
-        let ledger = Arc::new(RwLock::new(ledger::TokenLedger::new(node_id.clone())));
+        // 3. 初始化统一台账（令牌 + 观测链 + 资产注册表）
+        let unified_ledger = Arc::new(RwLock::new(
+            ledger::UnifiedLedger::new(node_id.clone())
+        ));
 
         // 4. 启动调度器
-        let scheduler = scheduler::Scheduler::new(node_id.clone(), ledger.clone(), gossip.clone());
+        let scheduler = scheduler::Scheduler::new(
+            node_id.clone(),
+            unified_ledger.clone(),
+            gossip.clone(),
+        );
 
         // 5. 启动传输层
         let transport = transport::Transport::new(&config.listen_addr).await?;
@@ -46,7 +53,7 @@ impl Node {
         Ok(Node {
             id: node_id,
             gossip,
-            ledger,
+            unified_ledger,
             scheduler,
             transport,
             worker_registry,
