@@ -166,75 +166,143 @@ function startLanDiscovery() {
 }
 
 // ============================================================
-// WebGPU 推理引擎
+// WebGPU 推理引擎（通过 Offscreen Document）
 // ============================================================
+//
+// Service Worker 没有 navigator.gpu，所以 GPU 运算必须
+// 在一个隐藏的 Offscreen Document 中运行。
+// 这里封装了与 offscreen document 的通信。
 
-let webgpuDevice = null;
+let gpuAvailable = false;
+let gpuInfo = null;
 
 async function initWebGPU() {
-  if (webgpuDevice) return webgpuDevice;
+  try {
+    // 创建 Offscreen Document 并初始化 GPU
+    await ensureGPUWorker();
 
-  if (!navigator.gpu) {
-    console.warn('[ClawNet] WebGPU 不可用，降级为纯DOM模式');
-    return null;
+    const result = await sendToGPUWorker({ action: 'init' });
+
+    if (result.ready) {
+      gpuAvailable = true;
+      gpuInfo = result.info || { name: result.name };
+      addLog(`WebGPU: ✅ ${result.name}`);
+      await chrome.storage.local.set({
+        clawnet_webgpu: true,
+        clawnet_gpu_info: result.info
+      });
+
+      // 跑基准
+      try {
+        const bench = await sendToGPUWorker({ action: 'benchmark' });
+        addLog(`GPU 基准: ${bench.flops} · ${bench.opsPerSecond} ops/s`);
+        await chrome.storage.local.set({ clawnet_gpu_benchmark: bench });
+      } catch (e) {
+        addLog(`GPU 基准失败: ${e.message}`);
+      }
+
+      return true;
+    } else {
+      gpuAvailable = false;
+      addLog('WebGPU: ❌ 不可用');
+      await chrome.storage.local.set({ clawnet_webgpu: false });
+      return false;
+    }
+  } catch (e) {
+    gpuAvailable = false;
+    addLog(`WebGPU 初始化失败: ${e.message}`);
+    await chrome.storage.local.set({ clawnet_webgpu: false });
+    return false;
+  }
+}
+
+async function ensureGPUWorker() {
+  // 尝试创建 Offscreen Document
+  // 如果已存在会抛异常，忽略即可
+  try {
+    await chrome.offscreen.createDocument({
+      url: 'src/background/offscreen.html',
+      reasons: ['COMPUTE'],
+      justification: 'ClawNet 使用 WebGPU 进行 AI 推理计算'
+    });
+  } catch (e) {
+    // 如果已存在或已关闭，重新关闭再创建
+    if (e.message?.includes('already exists')) {
+      addLog('GPU Worker 已存在，复用');
+      return;
+    }
   }
 
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-  if (!adapter) {
-    console.warn('[ClawNet] 无法获取 WebGPU Adapter');
-    return null;
-  }
+  // 等待 GPU Worker 加载并发送就绪信号
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('GPU Worker 加载超时'));
+    }, 15000);
 
-  webgpuDevice = await adapter.requestDevice();
-  console.log(`[ClawNet] WebGPU 就绪: ${adapter.name || 'unknown'}`);
-  return webgpuDevice;
+    const handler = (msg) => {
+      if (msg.type === 'gpu-status') {
+        clearTimeout(timeout);
+        chrome.runtime.onMessage.removeListener(handler);
+        resolve();
+      }
+    };
+    chrome.runtime.onMessage.addListener(handler);
+  });
+}
+
+async function sendToGPUWorker(msg) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('GPU 通信超时')), 30000);
+
+    chrome.runtime.sendMessage(
+      { ...msg, target: 'gpu-worker' },
+      (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (!response?.ok) {
+          reject(new Error(response?.error || 'GPU 操作失败'));
+        } else {
+          resolve(response.result);
+        }
+      }
+    );
+  });
 }
 
 async function runInference(task) {
-  const device = await initWebGPU();
-  if (!device) {
+  if (!gpuAvailable) {
     return { error: 'WebGPU 不可用', fallback: 'dom-only' };
   }
 
-  // 任务类型分发
   switch (task.type) {
     case 'image-gen':
-      return await webgpuImageGen(device, task);
-    case 'inference':
-      return await webgpuLLMInference(device, task);
+      return {
+        status: 'model-required',
+        message: '图片生成需要加载模型（约 2GB），暂未自动下载',
+        models: ['sd-turbo (2.1GB)', 'tiny-sd (890MB)']
+      };
+    case 'benchmark':
+      return await sendToGPUWorker({ action: 'benchmark' });
+    case 'gpu-detect':
+      return await sendToGPUWorker({ action: 'detect' });
     default:
       return { error: `不支持的任务类型: ${task.type}` };
   }
 }
 
-async function webgpuImageGen(device, task) {
-  // WebGPU 文生图（对接 Web Stable Diffusion / FLUX）
-  // 占位：将在后续版本实现
-  console.log(`[ClawNet] 图片生成任务: ${task.prompt}`);
-  return { status: 'not-implemented', message: 'WebGPU 图片生成将在后续版本实现' };
-}
-
-async function webgpuLLMInference(device, task) {
-  // WebGPU 小模型推理
-  // 占位
-  console.log(`[ClawNet] 推理任务: ${task.model}`);
-  return { status: 'not-implemented', message: 'WebGPU 推理将在后续版本实现' };
-}
-
 // ============================================================
-// 能力检测
+// 能力检测（不依赖 navigator，用 static analysis）
 // ============================================================
 
 function detectCapabilities() {
   const caps = ['dom'];
 
-  if (navigator.gpu) caps.push('webgpu');
-  if (navigator.mediaDevices) caps.push('media');
+  // 无法在 Service Worker 中检测 navigator.gpu 或 deviceMemory
+  // 这些由 offscreen document 报告
+  if (gpuAvailable) caps.push('webgpu', 'gpu-ready');
 
-  // 检测大概是中端还是低端设备
-  const memory = navigator.deviceMemory || 4;
-  if (memory >= 8) caps.push('high-memory');
-  if (memory >= 4) caps.push('medium-memory');
+  caps.push('service-worker');
 
   return caps;
 }
