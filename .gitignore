@@ -4,3 +4,4 @@
 *.swo
 *.log
 ~/.clawnet/
+mvp/__pycache__/
