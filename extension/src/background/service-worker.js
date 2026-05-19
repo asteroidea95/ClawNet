@@ -425,13 +425,133 @@ function updateCurrentTask(task) {
 }
 
 // ============================================================
+// 监听 Popup 消息
+// ============================================================
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === 'clawnet-execute-task') {
+    executeUserTask(request.task).then(sendResponse);
+    return true;  // 异步响应
+  }
+});
+
+async function executeUserTask(task) {
+  updateStatus('computing');
+  updateCurrentTask(task);
+
+  addLog(`执行任务: [${task.type}] ${(task.description || '').slice(0, 50)}`);
+
+  let result;
+
+  if (task.type === 'image-gen' && webgpuDevice) {
+    result = await webgpuImageGen(webgpuDevice, task);
+  } else if (task.type.startsWith('dom-')) {
+    result = await executeDomTask(task);
+  } else {
+    result = { error: `未知任务类型: ${task.type}` };
+  }
+
+  // 记录任务完成
+  const stats = await chrome.storage.local.get('clawnet_tasks_done');
+  await chrome.storage.local.set({ clawnet_tasks_done: (stats.clawnet_tasks_done || 0) + 1 });
+
+  updateStatus('idle');
+  updateCurrentTask(null);
+  addLog(`✅ 任务完成`);
+
+  return result;
+}
+
+async function executeDomTask(task) {
+  // 支持三种模式：指定URL、当前活动标签页、所有标签页
+  let tab;
+
+  if (task.url) {
+    // 模式1：打开或切换到指定URL
+    const tabs = await chrome.tabs.query({ url: task.url.includes('*') ? task.url : undefined });
+    if (tabs.length > 0) {
+      tab = tabs[0];
+      await chrome.tabs.update(tab.id, { active: true });
+    } else {
+      tab = await chrome.tabs.create({ url: task.url });
+      // 等待页面加载
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  } else {
+    // 模式2：使用当前活跃标签页
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tabs.length === 0) return { error: '没有打开的标签页' };
+    tab = tabs[0];
+  }
+
+  try {
+    const result = await chrome.tabs.sendMessage(tab.id, {
+      type: 'clawnet-task',
+      task: { action: task.type.replace('dom-', ''), ...task.params, keyword: task.description }
+    });
+    return result || { status: 'no-response' };
+  } catch (e) {
+    return { error: `DOM 执行失败: ${e.message}（页面可能不支持 content script）` };
+  }
+}
+
+function addLog(msg) {
+  const now = new Date();
+  const ts = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
+  console.log(`[ClawNet ${ts}] ${msg}`);
+}
+
+// ============================================================
+// WebGPU 检测
+// ============================================================
+
+async function detectWebGPU() {
+  if (!navigator.gpu) {
+    await chrome.storage.local.set({ clawnet_webgpu: false });
+    addLog('WebGPU: 不可用（浏览器不支持或未开启）');
+    return false;
+  }
+
+  try {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) {
+      await chrome.storage.local.set({ clawnet_webgpu: false });
+      addLog('WebGPU: 无可用适配器');
+      return false;
+    }
+
+    const device = await adapter.requestDevice();
+    const name = adapter.name || 'unknown GPU';
+    addLog(`WebGPU: ✅ ${name}`);
+    await chrome.storage.local.set({ clawnet_webgpu: true });
+    return true;
+  } catch (e) {
+    addLog(`WebGPU: ❌ ${e.message}`);
+    await chrome.storage.local.set({ clawnet_webgpu: false });
+    return false;
+  }
+}
+
+// ============================================================
 // 启动
 // ============================================================
 
 chrome.runtime.onInstalled.addListener(async () => {
   await ledger.init();
+
+  // 记录启动时间
+  await chrome.storage.local.set({ clawnet_uptime: Date.now() });
+
+  // 检测 WebGPU
+  await detectWebGPU();
+
+  // 连接信令服务器
   await connectSignaling();
-  await initWebGPU();
+
+  // 上报能力
+  const caps = detectCapabilities();
+  await chrome.storage.local.set({ clawnet_capabilities: caps });
+  addLog(`能力: ${caps.join(', ')}`);
 
   // 定时同步
   chrome.alarms.create('clawnet-sync', { periodInMinutes: 5 });
@@ -457,4 +577,4 @@ self.__CLAWNET__ = {
   onStatusUpdate
 };
 
-console.log('[ClawNet] 后台服务已启动');
+addLog('🚀 ClawNet 后台服务已启动');
