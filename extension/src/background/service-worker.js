@@ -1,0 +1,460 @@
+/**
+ * ClawNet — 后台服务 Worker
+ * 
+ * 职责：
+ *   1. WebRTC P2P 组网（节点发现 + 连接管理）
+ *   2. WebGPU 推理（执行算力任务）
+ *   3. 令牌台账管理
+ *   4. 任务队列管理
+ */
+
+// ============================================================
+// 节点身份
+// ============================================================
+
+let nodeId = null;
+let nodeIdPromise = null;
+
+async function getNodeId() {
+  if (nodeId) return nodeId;
+  if (nodeIdPromise) return nodeIdPromise;
+
+  nodeIdPromise = (async () => {
+    const stored = await chrome.storage.local.get('clawnet_node_id');
+    if (stored.clawnet_node_id) {
+      nodeId = stored.clawnet_node_id;
+      return nodeId;
+    }
+
+    // 生成 Ed25519 密钥对（通过 Web Crypto API）
+    const keyPair = await crypto.subtle.generateKey(
+      { name: 'Ed25519', namedCurve: 'Ed25519' },
+      true,
+      ['sign', 'verify']
+    );
+    const pubKey = await crypto.subtle.exportKey('raw', keyPair.publicKey);
+    const nodeIdStr = Array.from(new Uint8Array(pubKey))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('').slice(0, 16);  // 取前16位做展示ID
+
+    await chrome.storage.local.set({
+      clawnet_node_id: nodeIdStr,
+      clawnet_key_pair: { publicKey: Array.from(new Uint8Array(pubKey)) }
+    });
+
+    nodeId = nodeIdStr;
+    return nodeId;
+  })();
+
+  return nodeIdPromise;
+}
+
+// ============================================================
+// 信令服务器连接
+// ============================================================
+
+const SIGNALING_SERVER = 'wss://signaling.clawnet.dev';
+let signalingWs = null;
+let peers = new Map();  // peerId -> RTCPeerConnection
+
+async function connectSignaling() {
+  const id = await getNodeId();
+
+  try {
+    signalingWs = new WebSocket(SIGNALING_SERVER);
+  } catch (e) {
+    // 没有信令服务器时，降级为 LAN 广播
+    console.warn('[ClawNet] 信令服务器不可用，降级为局域网发现');
+    startLanDiscovery();
+    return;
+  }
+
+  signalingWs.onopen = () => {
+    signalingWs.send(JSON.stringify({
+      type: 'register',
+      nodeId: id,
+      capabilities: detectCapabilities()
+    }));
+    updateStatus('connected');
+  };
+
+  signalingWs.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+    await handleSignalingMessage(msg);
+  };
+
+  signalingWs.onclose = () => {
+    updateStatus('disconnected');
+    setTimeout(connectSignaling, 5000);
+  };
+}
+
+async function handleSignalingMessage(msg) {
+  switch (msg.type) {
+    case 'peer-list':
+      // 收到在线节点列表
+      for (const peer of msg.peers) {
+        if (peer.nodeId !== await getNodeId() && !peers.has(peer.nodeId)) {
+          connectToPeer(peer);
+        }
+      }
+      break;
+
+    case 'offer':
+    case 'answer':
+    case 'ice-candidate':
+      // WebRTC 信令
+      await handleRTCSignal(msg);
+      break;
+  }
+}
+
+// ============================================================
+// WebRTC P2P 连接
+// ============================================================
+
+async function connectToPeer(peerInfo) {
+  const config = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+    ]
+  };
+
+  const pc = new RTCPeerConnection(config);
+  peers.set(peerInfo.nodeId, pc);
+
+  // 用于传输任务数据的 DataChannel
+  const dc = pc.createDataChannel('clawnet-tasks', {
+    ordered: true
+  });
+
+  dc.onmessage = (event) => handleTaskMessage(event.data, peerInfo.nodeId);
+  dc.onopen = () => console.log(`[ClawNet] P2P 连接已建立: ${peerInfo.nodeId}`);
+
+  // 交换 ICE 候选
+  pc.onicecandidate = (event) => {
+    if (event.candidate && signalingWs) {
+      signalingWs.send(JSON.stringify({
+        type: 'ice-candidate',
+        target: peerInfo.nodeId,
+        candidate: event.candidate
+      }));
+    }
+  };
+
+  // 创建 Offer
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  if (signalingWs) {
+    signalingWs.send(JSON.stringify({
+      type: 'offer',
+      target: peerInfo.nodeId,
+      sdp: offer
+    }));
+  }
+}
+
+// ============================================================
+// LAN 发现（降级方案）
+// ============================================================
+
+function startLanDiscovery() {
+  // 通过 WebRTC 不带信令的直连尝试
+  // 或通过 mDNS / 局域网广播
+  console.log('[ClawNet] LAN 发现模式（待实现）');
+}
+
+// ============================================================
+// WebGPU 推理引擎
+// ============================================================
+
+let webgpuDevice = null;
+
+async function initWebGPU() {
+  if (webgpuDevice) return webgpuDevice;
+
+  if (!navigator.gpu) {
+    console.warn('[ClawNet] WebGPU 不可用，降级为纯DOM模式');
+    return null;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) {
+    console.warn('[ClawNet] 无法获取 WebGPU Adapter');
+    return null;
+  }
+
+  webgpuDevice = await adapter.requestDevice();
+  console.log(`[ClawNet] WebGPU 就绪: ${adapter.name || 'unknown'}`);
+  return webgpuDevice;
+}
+
+async function runInference(task) {
+  const device = await initWebGPU();
+  if (!device) {
+    return { error: 'WebGPU 不可用', fallback: 'dom-only' };
+  }
+
+  // 任务类型分发
+  switch (task.type) {
+    case 'image-gen':
+      return await webgpuImageGen(device, task);
+    case 'inference':
+      return await webgpuLLMInference(device, task);
+    default:
+      return { error: `不支持的任务类型: ${task.type}` };
+  }
+}
+
+async function webgpuImageGen(device, task) {
+  // WebGPU 文生图（对接 Web Stable Diffusion / FLUX）
+  // 占位：将在后续版本实现
+  console.log(`[ClawNet] 图片生成任务: ${task.prompt}`);
+  return { status: 'not-implemented', message: 'WebGPU 图片生成将在后续版本实现' };
+}
+
+async function webgpuLLMInference(device, task) {
+  // WebGPU 小模型推理
+  // 占位
+  console.log(`[ClawNet] 推理任务: ${task.model}`);
+  return { status: 'not-implemented', message: 'WebGPU 推理将在后续版本实现' };
+}
+
+// ============================================================
+// 能力检测
+// ============================================================
+
+function detectCapabilities() {
+  const caps = ['dom'];
+
+  if (navigator.gpu) caps.push('webgpu');
+  if (navigator.mediaDevices) caps.push('media');
+
+  // 检测大概是中端还是低端设备
+  const memory = navigator.deviceMemory || 4;
+  if (memory >= 8) caps.push('high-memory');
+  if (memory >= 4) caps.push('medium-memory');
+
+  return caps;
+}
+
+// ============================================================
+// 令牌台账（本地 CRDT）
+// ============================================================
+
+class TokenLedger {
+  constructor() {
+    this.balances = {};  // { [from-to]: amount }
+    this.nodeId = null;
+  }
+
+  async init() {
+    this.nodeId = await getNodeId();
+    const stored = await chrome.storage.local.get('clawnet_ledger');
+    if (stored.clawnet_ledger) {
+      this.balances = stored.clawnet_ledger;
+    }
+  }
+
+  async save() {
+    await chrome.storage.local.set({ clawnet_ledger: this.balances });
+  }
+
+  settle(from, to, amount) {
+    const key = `${from}->${to}`;
+    this.balances[key] = (this.balances[key] || 0) + amount;
+    this.save();
+  }
+
+  netBalance(nodeId) {
+    let credit = 0, debit = 0;
+    for (const [key, amount] of Object.entries(this.balances)) {
+      const [from, to] = key.split('->');
+      if (to === nodeId) credit += amount;
+      if (from === nodeId) debit += amount;
+    }
+    return credit - debit;
+  }
+
+  merge(other) {
+    for (const [key, amount] of Object.entries(other)) {
+      const current = this.balances[key] || 0;
+      if (amount > current) {
+        this.balances[key] = amount;
+      }
+    }
+    this.save();
+  }
+}
+
+const ledger = new TokenLedger();
+
+// ============================================================
+// 任务处理
+// ============================================================
+
+let taskQueue = [];
+
+async function handleTaskMessage(data, fromPeer) {
+  const task = JSON.parse(data);
+
+  // 加入队列
+  taskQueue.push(task);
+  updateTaskCount();
+
+  // 按令牌优先级排序
+  taskQueue.sort((a, b) => (b.reward || 0) - (a.reward || 0));
+
+  // 如果队列变长，开始执行
+  if (taskQueue.length === 1) {
+    processNextTask();
+  }
+}
+
+async function processNextTask() {
+  if (taskQueue.length === 0) return;
+
+  const task = taskQueue.shift();
+  updateTaskCount();
+
+  // 更新状态
+  updateStatus('computing');
+  updateCurrentTask(task);
+
+  let result;
+  switch (task.type) {
+    case 'dom-search':
+      result = await executeDomSearch(task);
+      break;
+    case 'image-gen':
+      result = await runInference(task);
+      break;
+    default:
+      result = { error: `未知任务类型: ${task.type}` };
+  }
+
+  // 回传结果
+  const peer = peers.get(task.from);
+  if (peer) {
+    const dc = peer.createDataChannel('clawnet-result');
+    dc.onopen = () => dc.send(JSON.stringify({
+      taskId: task.id,
+      result
+    }));
+  }
+
+  // 记账
+  ledger.settle(task.from, await getNodeId(), task.reward || 1);
+
+  updateStatus('idle');
+  updateCurrentTask(null);
+
+  // 处理下一个
+  if (taskQueue.length > 0) {
+    processNextTask();
+  }
+}
+
+async function executeDomSearch(task) {
+  // 通过 content script 执行 DOM 搜索
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tabs.length === 0) return { error: '未找到活动标签页' };
+
+  try {
+    const result = await chrome.tabs.sendMessage(tabs[0].id, {
+      type: 'clawnet-task',
+      task
+    });
+    return result;
+  } catch (e) {
+    return { error: `DOM 执行失败: ${e.message}` };
+  }
+}
+
+// ============================================================
+// 状态同步
+// ============================================================
+
+async function syncState() {
+  // 定期通过 gossip 同步令牌台账
+  // 广播本节点状态给所有已连接的 peer
+  const id = await getNodeId();
+  const state = {
+    type: 'state-sync',
+    nodeId: id,
+    ledger: ledger.balances,
+    capabilities: detectCapabilities(),
+    queueLength: taskQueue.length
+  };
+
+  for (const [peerId, pc] of peers) {
+    try {
+      const dc = pc.createDataChannel('clawnet-sync');
+      dc.onopen = () => {
+        dc.send(JSON.stringify(state));
+        dc.close();
+      };
+    } catch (e) {
+      // 连接可能已断开
+    }
+  }
+}
+
+// ============================================================
+// UI 更新
+// ============================================================
+
+let statusCallbacks = [];
+
+function onStatusUpdate(cb) {
+  statusCallbacks.push(cb);
+}
+
+function updateStatus(status) {
+  chrome.storage.local.set({ clawnet_status: status });
+  statusCallbacks.forEach(cb => cb(status));
+}
+
+function updateTaskCount() {
+  chrome.storage.local.set({ clawnet_queue_length: taskQueue.length });
+}
+
+function updateCurrentTask(task) {
+  chrome.storage.local.set({ clawnet_current_task: task ? task.description || task.type : null });
+}
+
+// ============================================================
+// 启动
+// ============================================================
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await ledger.init();
+  await connectSignaling();
+  await initWebGPU();
+
+  // 定时同步
+  chrome.alarms.create('clawnet-sync', { periodInMinutes: 5 });
+
+  // 心跳
+  chrome.alarms.create('clawnet-heartbeat', { periodInMinutes: 1 });
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'clawnet-sync') syncState();
+  if (alarm.name === 'clawnet-heartbeat') {
+    updateStatus(peers.size > 0 ? 'connected' : 'disconnected');
+  }
+});
+
+// 导出供 popup 使用
+self.__CLAWNET__ = {
+  getNodeId,
+  getPeers: () => peers.size,
+  getBalance: () => ledger.netBalance(nodeId),
+  getStatus: () => chrome.storage.local.get('clawnet_status').then(s => s.clawnet_status || 'init'),
+  getQueueLength: () => taskQueue.length,
+  onStatusUpdate
+};
+
+console.log('[ClawNet] 后台服务已启动');

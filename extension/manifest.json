@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "ClawNet",
+  "version": "0.1.0",
+  "description": "把你的闲置算力变成全球AI网络的一部分",
+  "homepage_url": "https://github.com/asteroidea95/ClawNet",
+
+  "permissions": [
+    "storage",
+    "alarms"
+  ],
+
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "public/icon-16.png",
+      "48": "public/icon-48.png",
+      "128": "public/icon-128.png"
+    },
+    "default_title": "ClawNet"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["public/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
