@@ -1,0 +1,13 @@
+{
+  "canonical_hash": "88b179b085bd7d020f765af5db07128f463cb17a2812bb06b08c3215c2fe5084",
+  "canonical_raw": "func add(us_):\n b int) in{\n      r~ } n b + == 0l   return +     }\n =  r",
+  "canonical_normalized": "func v_0(v_1): v_2 int) in{ v_3~ } v_4 v_2 + == 0l return + } = v_3",
+  "second_run_hash": "88b179b085bd7d020f765af5db07128f463cb17a2812bb06b08c3215c2fe5084",
+  "diff_seed_hash": "19e25fadc3ec71ee4f18956b87ee992e09a38557883a13f97b0202a8acb052e4",
+  "same_input_consistent": true,
+  "diff_input_different": true,
+  "prompt": "func add",
+  "model_params": 834784,
+  "seed_42_42_same": true,
+  "seed_42_999_different": true
+}

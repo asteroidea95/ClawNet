@@ -1,0 +1,8 @@
+HASH:0f49eb821e0b8b2c6c52ea1b43ffd6b11c8b3da8a9564fc516b372996eb3a567
+RAW:func add(as_u:(nuretuV int {
+    r~ ( n b + b
+} b
+ ay a= E a
+    }
++   r
+NORM:func __VAR_0__(__VAR_1__:(__VAR_2__ int {__VAR_3__~ (__VAR_4__ __VAR_5__ + __VAR_5__} __VAR_5__ __VAR_6__ __VAR_7__= __VAR_8__ __VAR_7__} + __VAR_3__

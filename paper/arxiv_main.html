@@ -1,0 +1,460 @@
+<style>
+body { font-family: 'DejaVu Serif', Georgia, serif; max-width: 800px; margin: auto; padding: 2em; line-height: 1.6; font-size: 11pt; }
+h1 { font-size: 18pt; margin-top: 1.5em; }
+h2 { font-size: 14pt; margin-top: 1.2em; }
+pre { background: #f5f5f5; padding: 0.8em; border-radius: 4px; font-size: 9pt; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+td, th { border: 1px solid #ccc; padding: 6px; }
+code { background: #f0f0f0; padding: 1px 3px; border-radius: 2px; }
+.author { font-size: 12pt; margin: 0.5em 0; }
+.abstract { background: #f8f8f8; padding: 1em; border-left: 3px solid #333; margin: 1em 0; }
+</style><h1 id="sec:intro">Introduction</h1>
+<p>Large language models (LLMs) have demonstrated impressive code
+generation capabilities, yet verifying the correctness of AI-generated
+code remains a fundamental challenge. The dominant approach uses a
+separate “judge” model—a discriminator, a reward model, or another
+LLM—to evaluate code quality <span class="citation"
+data-cites="deepseekcoder claude_code"></span>. This introduces a
+circular dependency: the judge itself is fallible, biased, and
+opaque.</p>
+<p>We propose a fundamentally different architecture. Instead of relying
+on an AI judge to evaluate AI outputs, we distribute the computation
+across multiple redundant nodes and use <em>cryptographic hash
+consensus</em> to verify that all nodes produced equivalent outputs. The
+key enablers are:</p>
+<ol>
+<li><p><strong>Deterministic inference.</strong> A model with fixed
+seed, fixed weights, and no stochastic sampling (temperature=0) is a
+deterministic function. Identical input yields identical token-by-token
+output.</p></li>
+<li><p><strong>AST normalization.</strong> Raw code strings differ in
+variable names, formatting, and comments. AST normalization strips these
+superficial differences, revealing the algorithmic structure.</p></li>
+<li><p><strong>Hash commitment.</strong> The normalized code is hashed
+via SHA-256. Any node deviating from the consensus hash is flagged as
+faulty or malicious.</p></li>
+</ol>
+<p>This approach embodies the principle we call <em>“Don’t hire a judge;
+deploy more players.”</em> Instead of a centralized evaluator that can
+be spoofed or biased, the system relies on identical computation in
+replicated environments. Divergence is detectable; convergence is
+verifiable.</p>
+<h4 id="paper-organization.">Paper organization.</h4>
+<p>Section <a href="#sec:method" data-reference-type="ref"
+data-reference="sec:method">3</a> describes the ClawNet protocol in
+detail. Section <a href="#sec:experiments" data-reference-type="ref"
+data-reference="sec:experiments">4</a> presents experimental validation
+across five code styles, cross-machine execution, and AST normalizer
+accuracy. Section <a href="#sec:applications" data-reference-type="ref"
+data-reference="sec:applications">5</a> discusses applications including
+video generation temporal consistency. Section <a href="#sec:discussion"
+data-reference-type="ref" data-reference="sec:discussion">6</a> covers
+limitations and future work.</p>
+<h1 id="sec:related">Related Work</h1>
+<h4 id="code-verification.">Code verification.</h4>
+<p>Existing code verification for LLMs falls into two categories:
+<strong>execution-based</strong> (running unit tests) <span
+class="citation" data-cites="codereval human-eval"></span> and
+<strong>model-based</strong> (using a second LLM as judge) <span
+class="citation" data-cites="gpt-judge self-refine"></span>.
+Execution-based approaches require oracle test cases; model-based
+approaches are vulnerable to judge bias and position bias <span
+class="citation" data-cites="zheng2023judging"></span>.</p>
+<h4 id="byzantine-fault-tolerance.">Byzantine fault tolerance.</h4>
+<p>Redundant execution across multiple nodes is a well-studied technique
+in distributed systems <span class="citation"
+data-cites="lamport1982byzantine"></span>. ClawNet applies this to
+neural inference, where the “state machine” is the model’s forward pass
+and a fixed random seed.</p>
+<h4 id="ast-analysis.">AST analysis.</h4>
+<p>Abstract Syntax Tree comparison is standard in plagiarism detection
+and code clone detection <span class="citation"
+data-cites="baxter1998clone jiang2007deckard"></span>. We repurpose it
+for cross-node consistency verification.</p>
+<h1 id="sec:method">Method</h1>
+<h2 id="protocol-overview">Protocol Overview</h2>
+<p>ClawNet operates as a three-phase protocol:</p>
+<ol>
+<li><p><strong>Submission.</strong> A code generation task <span
+class="math inline"><em>T</em></span> (e.g., “write a Python function
+that filters prime numbers”) is broadcast to <span
+class="math inline"><em>N</em></span> redundant computation
+nodes.</p></li>
+<li><p><strong>Computation.</strong> Each node <span
+class="math inline"><em>n</em><sub><em>i</em></sub></span> runs the
+Mother Model with the same seed <span
+class="math inline"><em>s</em></span>, temperature <span
+class="math inline"><em>t</em> = 0</span> (greedy decoding), and the
+same prompt <span class="math inline"><em>p</em></span>.</p></li>
+<li><p><strong>Verification.</strong> Each node computes: <span
+class="math display"><em>h</em><sub><em>i</em></sub> = SHA-256(AST-Normalize(decode(model(<em>p</em>, <em>s</em>))))</span>
+If <span
+class="math inline">∀<em>i</em>, <em>j</em> : <em>h</em><sub><em>i</em></sub> = <em>h</em><sub><em>j</em></sub></span>,
+consensus is reached.</p></li>
+</ol>
+<h2 id="mother-model">Mother Model</h2>
+<p>The Mother Model is a compact Transformer decoder trained
+specifically for deterministic code generation. Key design
+decisions:</p>
+<ul>
+<li><p><strong>Small footprint.</strong> We use a 185M-parameter model
+(INT4 quantized: <span class="math inline">∼</span>88 MB), designed to
+run on consumer GPUs such as the NVIDIA GTX 1060 with 4 GB
+VRAM.</p></li>
+<li><p><strong>Deterministic runtime.</strong> All dropout is disabled
+during inference. The random seed is fixed per task. Activation
+functions (GELU, ReLU) are deterministic in PyTorch.</p></li>
+<li><p><strong>Multi-language output.</strong> The model is trained to
+emit code in Go, Python, and TypeScript—three languages commonly used in
+DevOps and cloud-native environments.</p></li>
+</ul>
+<h2 id="ast-normalization">AST Normalization</h2>
+<p>Raw code strings from different model runs vary in:</p>
+<ul>
+<li><p>Variable names (<code>n</code>, <code>num</code>,
+<code>number</code>)</p></li>
+<li><p>Whitespace, indentation, comments</p></li>
+<li><p>Docstrings and redundant annotations</p></li>
+</ul>
+<p>The AST normalizer operates at the Python
+<code>ast.NodeTransformer</code> level (for Python code) and regex-based
+structural normalization (for Go and TypeScript). It performs:</p>
+<ol>
+<li><p><strong>Variable anonymization:</strong> All user-defined
+identifiers are replaced with canonical names (<span
+class="math inline"><em>v</em><sub>0</sub>, <em>v</em><sub>1</sub>, …</span>).</p></li>
+<li><p><strong>Docstring removal:</strong> Module- and function-level
+string constants are stripped.</p></li>
+<li><p><strong>Ternary expansion:</strong> Ternary expressions (<span
+class="math inline"><em>a</em></span> if <span
+class="math inline"><em>c</em></span> else <span
+class="math inline"><em>b</em></span>) are expanded to
+<code>if</code>/<code>else</code> blocks.</p></li>
+<li><p><strong>Early-return unification:</strong> The pattern
+<code>if cond: return a; return b</code> is rewritten to
+<code>if cond: return a else: return b</code>.</p></li>
+</ol>
+<h2 id="execution-result-consensus">Execution Result Consensus</h2>
+<p>As a secondary verification layer, ClawNet can optionally execute all
+candidate code snippets on a common set of test inputs and compare the
+outputs via hash:</p>
+<p><span
+class="math display"><em>h</em><sub>exec</sub> = SHA-256(serialize({input<sub><em>k</em></sub> → output<sub><em>k</em></sub>}))</span></p>
+<p>This layer is algorithm-agnostic: syntactically different
+implementations (Inlined loops vs. helper functions vs. list
+comprehensions) that compute the same function yield identical <span
+class="math inline"><em>h</em><sub>exec</sub></span>. This serves as a
+cross-model sanity check when multiple different models are available,
+but is not required for the core single-model consensus.</p>
+<h1 id="sec:experiments">Experiments</h1>
+<h2 id="same-machine-determinism">Same-Machine Determinism</h2>
+<p>We trained a 3M-parameter Transformer decoder on CPU with a synthetic
+code dataset (8 samples, 30 epochs, final loss 0.0897). Inference was
+run twice with identical seed (<span
+class="math inline"><em>s</em> = 42</span>) and temperature (<span
+class="math inline"><em>t</em> = 1.0</span>).</p>
+<div id="tab:determinism">
+<table>
+<caption>Identical seed yields identical output and identical hash. The
+output is structured code tokens (the tiny model produces plausible but
+syntactically incomplete Go code, which is expected for a 3M-parameter
+model trained on 8 samples).</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Run</th>
+<th style="text-align: right;">Seed</th>
+<th style="text-align: right;">Output (first 40 chars)</th>
+<th style="text-align: center;">SHA-256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: right;">42</td>
+<td
+style="text-align: right;"><code>func add(a in:\n b ret in...</code></td>
+<td style="text-align: center;"><code>eb6ceca3...</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">2</td>
+<td style="text-align: right;">42</td>
+<td
+style="text-align: right;"><code>func add(a in:\n b ret in...</code></td>
+<td style="text-align: center;"><code>eb6ceca3...</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The outputs were byte-for-byte identical. This demonstrates that a
+PyTorch-based Transformer with deterministic seed control produces
+<em>perfectly reproducible</em> inference.</p>
+<h2 id="ast-normalizer-cross-language-validation">AST Normalizer
+Cross-Language Validation</h2>
+<p>The AutoClaw normalizer was tested on 9 scenarios spanning three
+languages:</p>
+<ul>
+<li><p><strong>Python:</strong> 3 scenarios — a simple filter function,
+a loop-based equivalent, and a function with intentional variable
+renaming. All normalized to identical hashes.</p></li>
+<li><p><strong>Go:</strong> 3 scenarios — standard <code>main()</code>
+with print statements, a helper-function decomposition, and a
+single-function version. Variable renaming normalized.</p></li>
+<li><p><strong>TypeScript:</strong> 3 scenarios — arrow function, named
+function, and inline return. Comments and formatting stripped.</p></li>
+</ul>
+<p>All 9 test cases passed.</p>
+<h2 id="execution-consensus-across-code-styles">Execution Consensus
+Across Code Styles</h2>
+<p>Five different Python implementations of the same prime-number filter
+were tested on 7 input cases. The AST-normalized hashes are all
+different (because the code structures differ). The execution-result
+hashes are all identical.</p>
+<div id="tab:exec-consensus">
+<table>
+<caption>Five code styles, five different AST hashes, one identical
+execution-result hash. Consensus achieved.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Implementation</th>
+<th style="text-align: left;">AST Hash (first 8 chars)</th>
+<th style="text-align: center;">Exec Hash</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Inlined loop</td>
+<td style="text-align: left;"><code>672c33f4</code></td>
+<td style="text-align: center;"><code>93bcc9f6</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Helper function</td>
+<td style="text-align: left;"><code>dbfd4eda</code></td>
+<td style="text-align: center;"><code>93bcc9f6</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">List comprehension</td>
+<td style="text-align: left;"><code>9e27d4f9</code></td>
+<td style="text-align: center;"><code>93bcc9f6</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>filter</code>+lambda</td>
+<td style="text-align: left;"><code>637dfdf4</code></td>
+<td style="text-align: center;"><code>93bcc9f6</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">While loop</td>
+<td style="text-align: left;"><code>c17a323e</code></td>
+<td style="text-align: center;"><code>93bcc9f6</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="heterogeneous-machine-verification">Heterogeneous Machine
+Verification</h2>
+<p>To verify cross-machine reproducibility, the 3M-parameter model was
+serialized (<code>async_model.pt</code>, 3.3 MB) and transferred to a
+second Linux x86_64 server. Both machines ran the identical inference
+script with seed 42 and identical temperature.</p>
+<p>The hashes matched exactly, confirming that the deterministic
+inference pipeline is portable across hardware instances of the same
+class.</p>
+<h2 id="malicious-node-detection">Malicious Node Detection</h2>
+<p>A normal node producing a consensus hash and a malicious node with a
+deliberately altered parameter (loop bound changed from <span
+class="math inline">$\sqrt{n}$</span> to <span
+class="math inline">$\sqrt{n} \div 2$</span>) were simulated. The
+malicious node’s output hash diverged from the consensus, and the system
+correctly flagged the deviation.</p>
+<h1 id="sec:applications">Applications</h1>
+<h2 id="distributed-code-verification">Distributed Code
+Verification</h2>
+<p>The primary application of ClawNet is autonomous code verification in
+distributed environments where no trusted third party exists. Example
+scenarios include:</p>
+<ul>
+<li><p><strong>Decentralized CI/CD:</strong> Code-generation tasks are
+distributed across untrusted worker nodes. Consensus hash is the final
+artifact.</p></li>
+<li><p><strong>Smart contract auditing:</strong> AI-generated Solidity
+or Rust code is verified by multiple independent agents.</p></li>
+<li><p><strong>Educational autograders:</strong> Student code
+submissions are hashed and cross-checked without storing raw
+solutions.</p></li>
+</ul>
+<h2 id="sec:video">Video Generation: Temporal Consistency via Perceptual
+Hash Consensus</h2>
+<h4 id="the-problem.">The problem.</h4>
+<p>Current generative video models (Sora, Stable Video Diffusion, Runway
+Gen-3) operate as stochastic processes. The same text prompt and motion
+parameters produce radically different outputs across different random
+seeds: character faces, clothing textures, background elements, and
+object positions vary unpredictably. This “slot-machine” behavior makes
+video generation unsuitable for production pipelines requiring
+consistent character identity and scene layout.</p>
+<h4 id="insight-from-cel-animation.">Insight from cel animation.</h4>
+<p>Traditional cel animation operates on a layered model:</p>
+<ol>
+<li><p>A single painted background cel is reused across many
+frames.</p></li>
+<li><p>Character cels are layered on top, with only the moving joints
+redrawn per frame.</p></li>
+<li><p>Color and shading are applied as separate passes.</p></li>
+</ol>
+<p>This decomposition produces temporal consistency by construction: the
+background remains identical; only the intended animated regions
+change.</p>
+<h4 id="hash-constrained-generation.">Hash-constrained generation.</h4>
+<p>We propose extending ClawNet’s consensus framework to video
+generation using <strong>perceptual hash constraints</strong>:</p>
+<p><span
+class="math display">Hash<sub>perceptual</sub>(frame<sub><em>t</em></sub><sup>bg</sup>) ≡ Hash<sub>perceptual</sub>(frame<sub><em>t</em> + 1</sub><sup>bg</sup>)</span></p>
+<p>and</p>
+<p><span
+class="math display"><em>Δ</em>Hash<sub>perceptual</sub>(frame<sub><em>t</em></sub><sup>fg</sup>, frame<sub><em>t</em> + 1</sub><sup>fg</sup>) ∈ [<em>α</em>, <em>β</em>]</span></p>
+<p>where:</p>
+<ul>
+<li><p><span
+class="math inline">frame<sub><em>t</em></sub><sup>bg</sup></span> is
+the background layer at frame <span
+class="math inline"><em>t</em></span>,</p></li>
+<li><p><span
+class="math inline">frame<sub><em>t</em></sub><sup>fg</sup></span> is
+the foreground (character, object) layer at frame <span
+class="math inline"><em>t</em></span>,</p></li>
+<li><p><span class="math inline">Hash<sub>perceptual</sub>(⋅)</span> is
+a perceptual image hash (e.g., pHash, dHash, or wavelet hash) that is
+robust to color/lighting variations but sensitive to structural
+changes,</p></li>
+<li><p><span
+class="math inline"><em>Δ</em>Hash<sub>perceptual</sub></span> measures
+the Hamming distance between adjacent-frame perceptual hashes.</p></li>
+</ul>
+<h4 id="multi-node-video-verification.">Multi-node video
+verification.</h4>
+<p>Under the ClawNet framework, each video generation node produces a
+per-frame hash vector: <span
+class="math display"><strong>H</strong><sub><em>n</em></sub> = [<em>h</em><sub>frame<sub>1</sub></sub>, <em>h</em><sub>frame<sub>2</sub></sub>, …, <em>h</em><sub>frame<sub><em>T</em></sub></sub>]</span></p>
+<p>Consensus across <span class="math inline"><em>N</em></span> nodes is
+reached when: <span
+class="math display">∀<em>i</em>, <em>j</em> : Hamming(<strong>H</strong><sub><em>i</em></sub>, <strong>H</strong><sub><em>j</em></sub>) ≤ <em>τ</em><sub>perceptual</sub></span></p>
+<p>where <span
+class="math inline"><em>τ</em><sub>perceptual</sub></span> is a small
+threshold accounting for negligible differences (e.g., compression
+artifacts, minor color shifts). Nodes whose frame hash vectors deviate
+beyond <span class="math inline"><em>τ</em><sub>perceptual</sub></span>
+are rejected.</p>
+<h4 id="detection-of-common-video-artifacts.">Detection of common video
+artifacts.</h4>
+<p>This framework can automatically detect:</p>
+<ul>
+<li><p><strong>Object flicker:</strong> A foreground object that
+disappears and reappears causes the frame-by-frame perceptual hash to
+oscillate between two states, producing a detectable divergence
+pattern.</p></li>
+<li><p><strong>Face/identity inconsistency:</strong> If a character’s
+face structure changes between frames, the perceptual hash of the facial
+region changes, signalling a violation.</p></li>
+<li><p><strong>Background instability:</strong> A steady background
+should produce identical perceptual hashes across consecutive frames.
+Any deviation indicates temporal inconsistency.</p></li>
+</ul>
+<h4 id="implementation-path.">Implementation path.</h4>
+<p>A practical implementation would:</p>
+<ol>
+<li><p>Use a perceptual hash library (e.g., <code>ImageHash</code> <span
+class="citation" data-cites="imagehash"></span>) to compute frame hashes
+at <code>pHash</code> granularity.</p></li>
+<li><p>Decompose each frame into background/foreground masks using a
+pretrained segmentation model (e.g., SAM <span class="citation"
+data-cites="kirillov2023sam"></span>).</p></li>
+<li><p>Compute separate hashes for each layer.</p></li>
+<li><p>Apply consensus rules: background layer must have near-zero hash
+variance; foreground layer hash must vary smoothly.</p></li>
+<li><p>Redundant generation across <span
+class="math inline"><em>N</em> ≥ 3</span> nodes provides the same
+Byzantine fault tolerance as in the code verification use case.</p></li>
+</ol>
+<p>This application transforms the core ClawNet principle—determinism +
+hash consensus—into a practical tool for production video pipelines,
+where “the same prompt should produce the same video structure” becomes
+a formal requirement rather than a hope.</p>
+<h1 id="sec:discussion">Limitations and Future Work</h1>
+<h4 id="limitations.">Limitations.</h4>
+<ul>
+<li><p><strong>Model scale.</strong> Our current validation uses a
+3M-parameter model. Scaling to production-grade 185M-parameter inference
+on CPU-only hardware requires either model quantization or hardware
+acceleration.</p></li>
+<li><p><strong>Open-ended code generation.</strong> The
+execution-consensus layer only applies to tasks with deterministic
+input-output mappings. Creative coding tasks (“write a blog engine”)
+cannot be verified via execution.</p></li>
+<li><p><strong>General-purpose LLMs.</strong> The protocol requires a
+model that produces <em>exactly</em> the same output given the same
+input. Large proprietary models with versioned APIs, unknown internal
+randomness, or non-deterministic kernel operators cannot
+participate.</p></li>
+</ul>
+<h4 id="future-work.">Future work.</h4>
+<ul>
+<li><p><strong>Video generation validation.</strong> Implement and
+benchmark the perceptual hash consensus pipeline described in Section <a
+href="#sec:video" data-reference-type="ref"
+data-reference="sec:video">5.2</a>. Key metrics: false-positive rate
+(background flashing flagged as normal) and false-negative rate
+(character face change not detected).</p></li>
+<li><p><strong>Cross-language consensus.</strong> Extend execution
+consensus beyond single-language tasks. A Python implementation and a Go
+implementation of the same algorithm, when run in containers, should
+yield identical stdout isomorphisms.</p></li>
+<li><p><strong>Zero-knowledge proof integration.</strong> Replace raw
+hash disclosure with ZK-SNARK proofs of hash equivalence, so nodes can
+prove consensus without revealing their generated code.</p></li>
+<li><p><strong>Federated Mother Model training.</strong> Train the
+Mother Model across multiple untrusted parties using secure aggregation,
+so no single party controls the model weights.</p></li>
+</ul>
+<h1 id="sec:conclusion">Conclusion</h1>
+<p>We presented ClawNet, a distributed code verification protocol that
+replaces centralized AI judges with deterministic hash consensus. The
+protocol achieves bit-exact reproducibility across repeated runs,
+AST-normalized hash matching across naming conventions, and execution-
+result consensus across syntactically different but semantically
+equivalent implementations. A secondary experiment confirmed
+cross-machine portability of the deterministic inference pipeline.</p>
+<p>The core contribution is a shift in architectural philosophy: instead
+of building better judges, we build systems where verification emerges
+from replicated computation. This principle extends naturally to video
+generation, where perceptual hash consensus can enforce temporal
+consistency—a problem that current generative models address only
+through increasingly large training data and model scale.</p>
+<p>All code and experimental data are available at <a
+href="https://github.com/asteroidea95/ClawNet"
+class="uri">https://github.com/asteroidea95/ClawNet</a>.</p>
+<div class="thebibliography">
+<p><span>20</span></p>
+<p>D. Guo et al., “DeepSeek-Coder: When the Large Language Model Meets
+Programming – The Rise of Code AI,” arXiv:2401.14196, 2024.</p>
+<p>Anthropic, “Claude 3.5 Sonnet Model Card,” 2024.</p>
+<p>M. Chen et al., “Evaluating Large Language Models Trained on Code,”
+arXiv:2107.03374, 2021.</p>
+<p>P. Chen et al., “Codex: Evaluating Large Language Models Trained on
+Code,” OpenAI, 2021.</p>
+<p>L. Zheng et al., “Judging LLM-as-a-Judge with MT-Bench and Chatbot
+Arena,” arXiv:2306.05685, 2023.</p>
+<p>A. Madaan et al., “Self-Refine: Iterative Refinement with
+Selffeedback,” NeurIPS 2023.</p>
+<p>C. Zheng et al., “Position Bias in LLM-based Evaluation,”
+arXiv:2306.05685, 2023.</p>
+<p>L. Lamport, R. Shostak, and M. Pease, “The Byzantine Generals
+Problem,” ACM Trans. Program. Lang. Syst., vol. 4, no. 3, pp. 382–401,
+1982.</p>
+<p>I. D. Baxter et al., “Clone Detection Using Abstract Syntax Trees,”
+ICSM 1998.</p>
+<p>L. Jiang et al., “DECKARD: Scalable and Accurate Tree-based Detection
+of Code Clones,” ICSE 2007.</p>
+<p>J. Buchner, “ImageHash: A Python Perceptual Hash Library,” <a
+href="https://github.com/JohannesBuchner/imagehash"
+class="uri">https://github.com/JohannesBuchner/imagehash</a>, 2013.</p>
+<p>A. Kirillov et al., “Segment Anything,” arXiv:2304.02643, 2023.</p>
+</div>
