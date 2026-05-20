@@ -75,15 +75,34 @@ class RotaryPositionEncoding(nn.Module):
     def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
         t = torch.arange(seq_len, device=device).float()
         freqs = torch.outer(t, self.inv_freq)
-        return torch.cat([freqs.sin(), freqs.cos()], dim=-1)  # (seq_len, dim)
+        return torch.cat([freqs.cos(), freqs.sin()], dim=-1)  # (seq_len, dim)
 
 
 def apply_rotary_emb(x: torch.Tensor, pos_cos_sin: torch.Tensor) -> torch.Tensor:
-    """应用 RoPE 到 x"""
-    cos = pos_cos_sin[:, :, x.shape[-1] // 2:]
-    sin = pos_cos_sin[:, :, :x.shape[-1] // 2]
-    x_rot = torch.cat([-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]], dim=-1)
-    return x * cos + x_rot * sin
+    """应用 RoPE 到 x
+    
+    x: (batch, seq_len, num_heads, head_dim)
+    pos_cos_sin: (1, seq_len, head_dim) — sin/cos interleaved
+    """
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    
+    cos = pos_cos_sin[:, :, :half]   # (1, seq_len, half)
+    sin = pos_cos_sin[:, :, half:]   # (1, seq_len, half)
+    
+    # 扩展 head 维度
+    cos = cos[:, :, None, :]  # (1, seq_len, 1, half)
+    sin = sin[:, :, None, :]  # (1, seq_len, 1, half)
+    
+    # 拆分 x 为两半
+    x1 = x[..., :half]  # (batch, seq_len, num_heads, half)
+    x2 = x[..., half:]  # (batch, seq_len, num_heads, half)
+    
+    # 旋转
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    
+    return torch.cat([out1, out2], dim=-1)
 
 
 # ============================================================
@@ -267,7 +286,8 @@ class IntentEncoder(nn.Module):
         cfg = config.intent_encoder
         
         self.token_embed = nn.Embedding(vocab_size, cfg.hidden_dim)
-        self.rope = RotaryPositionEncoding(cfg.hidden_dim, cfg.max_seq_len)
+        self.head_dim = cfg.hidden_dim // cfg.num_heads
+        self.rope = RotaryPositionEncoding(self.head_dim, cfg.max_seq_len)
         
         self.blocks = nn.ModuleList([
             TransformerBlock(cfg.hidden_dim, cfg.num_heads, dropout=cfg.dropout)
@@ -395,7 +415,8 @@ class FusionDecoder(nn.Module):
         
         # 轻量 Decoder 层
         self.token_embed = nn.Embedding(vocab_size, cfg.hidden_dim)
-        self.rope = RotaryPositionEncoding(cfg.hidden_dim, cfg.max_seq_len)
+        self.head_dim = cfg.hidden_dim // cfg.num_heads
+        self.rope = RotaryPositionEncoding(self.head_dim, cfg.max_seq_len)
         
         self.blocks = nn.ModuleList([
             TransformerBlock(cfg.hidden_dim, cfg.num_heads, dropout=cfg.dropout)
@@ -424,15 +445,16 @@ class FusionDecoder(nn.Module):
         
         # 作为 Decoder 的起始 token 嵌入
         x = self.token_embed(input_ids)
-        pos = self.rope(tgt_len, input_ids.device)
-        pos = pos[None, :, :]
         
         # 将 fused 拼到序列开头作为引导
         # (batch, 1 + tgt_len, hidden_dim)
         x = torch.cat([fused, x], dim=1)
+        full_len = 1 + tgt_len
+        
+        pos = self.rope(full_len, input_ids.device)
+        pos = pos[None, :, :]
         
         # Causal mask
-        full_len = 1 + tgt_len
         causal_mask = torch.triu(torch.ones(full_len, full_len, device=x.device, dtype=torch.bool), diagonal=1)
         if attn_mask is not None:
             # 扩展 attn_mask
